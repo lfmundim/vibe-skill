@@ -65,6 +65,10 @@ import sys, json, re
 
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mABCDEFGHJKSTfhilmnprsu]|\x1b\([AB]|\x0f|\x0e')
 tools_called = 0
+# Token estimation: 4 chars ~ 1 token (standard approximation).
+# Vibe streaming JSON contains full conversation; prompt = system+user+tool, completion = assistant.
+prompt_chars = 0
+completion_chars = 0
 
 def clean(line):
     line = line.replace('\r', '')
@@ -81,6 +85,12 @@ for raw in sys.stdin:
 
     role    = msg.get('role', '')
     content = msg.get('content', '') or ''
+
+    # Accumulate content length for token estimation
+    if role in ('system', 'user', 'tool'):
+        prompt_chars += len(content)
+    elif role == 'assistant':
+        completion_chars += len(content)
 
     if role in ('system', 'user'):
         continue
@@ -113,7 +123,11 @@ for raw in sys.stdin:
         else:
             print(f'  [tool]  {(first_line or content)[:100]}', flush=True)
 
+prompt_tok     = prompt_chars // 4
+completion_tok = completion_chars // 4
+total_tok      = prompt_tok + completion_tok
 print(f'Tool calls: {tools_called}')
+print(f'Mistral tokens (est.): ~{total_tok:,}  (~{prompt_tok:,} prompt + ~{completion_tok:,} completion)')
 "
 VIBE_EXIT=$?
 set -e
