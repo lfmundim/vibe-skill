@@ -130,10 +130,13 @@ try:
     prompt = stats.get('last_turn_prompt_tokens', 0)
     completion = stats.get('last_turn_completion_tokens', 0)
     total = stats.get('last_turn_total_tokens', prompt + completion)
+    cost_turn = (prompt * 1.5 + completion * 7.5) / 1_000_000
     cost = stats.get('session_cost', 0)
     session_total = stats.get('session_total_llm_tokens', 0)
-    print(f'Mistral tokens (real): {total:,}  ({prompt:,} prompt + {completion:,} completion)')
-    print(f'Session total so far : {session_total:,} tokens  |  cost ~\${cost:.4f}')
+    claude_cost = (prompt * 3.0 + completion * 15.0) / 1_000_000
+    print(f'Mistral tokens (real): {total:,}  ({prompt:,} prompt + {completion:,} completion)  |  cost ~\${cost_turn:.4f}')
+    print(f'Claude Sonnet 4.6 eq: same tokens would cost ~\${claude_cost:.4f}  (ratio x{claude_cost/cost_turn:.1f})' if cost_turn > 0 else f'Claude Sonnet 4.6 eq: ~\${claude_cost:.4f}')
+    print(f'Session total so far : {session_total:,} tokens  |  session cost ~\${cost:.4f}')
 except Exception as e:
     print(f'(token read failed: {e})')
 " 2>/dev/null
