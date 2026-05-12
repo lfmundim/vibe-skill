@@ -34,7 +34,7 @@ When you type `/vibe <instruction>` in Claude Code, this skill:
 
 ```bash
 # 1. Clone this repo
-git clone https://github.com/YOUR_USERNAME/vibe-skill.git
+git clone https://github.com/pcx-wave/vibe-skill.git
 cd vibe-skill
 
 # 2. Install the delegate script
