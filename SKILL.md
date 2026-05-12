@@ -16,6 +16,37 @@ allowed-tools:
 When the user invokes `/vibe <instruction>`, Claude delegates the implementation
 to Mistral Vibe via its programmatic mode, supervises in real time, and reports.
 
+---
+
+## Known Limits
+
+Hard constraints of Mistral Vibe CLI — not config options.
+
+### 1. Requires a pseudo-TTY
+Vibe checks for a TTY on startup. Without one (plain pipe), it hangs silently —
+0 tool calls, no output, silent timeout. The `vibe-delegate` script allocates a
+pseudo-TTY via `script -q -c "..." /dev/null`. **Never call vibe directly in a pipe.**
+
+### 2. UTF-8 / special chars cause `search_replace` failures
+Vibe's `search_replace` tool matches byte-for-byte. Accented chars, curly quotes,
+or emoji in `old_string` → silent match failure, no write. Workaround: use
+`python3 str.replace()` for those edits, or restructure the prompt to avoid them.
+
+### 3. Context saturation above ~12 turns
+Mistral's context fills with repeated file reads. Beyond 12 turns the model starts
+looping — re-reading files it already read, not making progress. Hard cap: `--max-turns 12`.
+
+### 4. `--output text` hides errors
+`--output text` buffers everything until the run ends and suppresses intermediate
+errors. Always use `--output streaming` (done automatically by `vibe-delegate`).
+
+### 5. Code duplication bug
+Vibe sometimes re-inserts a block it has already written (off-by-one in its diff
+logic). Check for duplicate function definitions or repeated class bodies after
+every run.
+
+---
+
 ## Known projects
 
 <!-- Customize this table for your own projects -->
@@ -78,7 +109,7 @@ VERIFY: grep for "def function_name" in file.py and confirm it exists.
 **Formulation rules:**
 - One task per prompt — never "also do X and Y"
 - Name the exact files to modify
-- Include a grep-based verification criterion (not a file re-read — see note below)
+- Include a grep-based verification criterion (not a file re-read)
 - Language: English (better Mistral performance)
 
 > ⚠️ **Shell safety**: if the prompt contains UTF-8 accented chars, emojis,
@@ -117,6 +148,14 @@ VERIFY: grep for "datetime.date" in app.py and confirm it appears in fetch_data.
 ~/tools/vibe-delegate "<workdir>" "<prompt>" [max-turns] [agent] [timeout-secs]
 ```
 
+| Argument       | Default  | Notes                                           |
+|----------------|----------|-------------------------------------------------|
+| `workdir`      | —        | Absolute path, must exist                       |
+| `prompt`       | —        | Self-contained task description                 |
+| `max-turns`    | `10`     | Mistral turn limit — hard cap at 12, never more |
+| `agent`        | *(none)* | See agent table below                           |
+| `timeout-secs` | `180`    | Wall-clock kill timer                           |
+
 The script allocates a pseudo-TTY via `script -q -c` (required — vibe hangs without one).
 
 **Available agents:**
@@ -146,18 +185,26 @@ The script allocates a pseudo-TTY via `script -q -c` (required — vibe hangs wi
 
 The script prints live:
 ```
-  [vibe] Done. Converted date to datetime.date in fetch_data().
-  [read]  /path/to/app.py
-  [tool]  file: /path/to/app.py
+=== VIBE START ===
+Workdir : /path/to/project
+Agent   : default
+Turns   : 10
+Timeout : 180s
+Prompt  : Stack: Python/Flask. File: app.py ...
+===================
+  [read]  app.py
+  [tool]  file: app.py
   [tool]  search_replace [OK] ...
-  [tool]  matches: 42:def fetch_data
+  [vibe]  Done. Converted date to datetime.date in fetch_data().
 Tool calls: 5
-
+Mistral tokens (real): 4,800  (4,600 prompt + 200 completion)  |  cost ~$0.0086
+Claude Sonnet 4.6 eq: same tokens would cost ~$0.0168  (ratio x2.0)
 === VIBE DONE (exit: 0) ===
 === SYNTAX OK (1 file(s) checked) ===
 
 === UNCOMMITTED CHANGES ===
  app.py | 4 ++--
+[log] → ~/.local/share/delegate-runs.jsonl  (4800 tokens, exit 0, 34.2s)
 ```
 
 **Red flags to act on immediately:**
@@ -167,9 +214,9 @@ Tool calls: 5
 | `[WARN]` | Vibe encountered an error | Read the error, fix manually |
 | `[tool]  search_replace [FAIL]` | UTF-8 match failure | Edit manually with Python `str.replace()` |
 | `exit: 1` or non-zero | Vibe failed / did not complete verification | Read diff, correct prompt |
-| No `[tool]  file:` lines | Vibe read but wrote nothing | Prompt was too vague or already done |
+| No `[tool]  file:` lines | Vibe read but wrote nothing | Prompt was too vague or task already done |
 | `=== SYNTAX ERRORS ===` | Post-run syntax check failed | **Fix before committing** |
-| Same file read 5+ times | Vibe is spinning — run likely lost | Abort, check diff, try again |
+| Same file read 5+ times | Vibe is looping — run likely lost | Abort, check diff, try again |
 
 **Known bugs and workarounds:**
 
@@ -216,6 +263,7 @@ Ready to commit?
 - **Don't code instead of Vibe** unless Vibe completed ≥50% and crashed.
 - **Max 12 turns per call** — beyond that, Mistral context saturates.
 - **VERIFY with grep, not file re-read** — `grep -n "def foo" file.py` is reliable.
+- **UTF-8 / emoji in the prompt** → the script handles it via temp file, but test with a short prompt first.
 
 ---
 
@@ -225,5 +273,65 @@ Vibe's internal turns (repeated file reads, etc.) consume **Mistral tokens**,
 not Claude tokens. Claude only receives the compressed final output (~500–1500 tokens/run).
 
 For a task with 6 reads of an 800-line file: ~4800 tokens on Mistral's side, 0 on Claude's.
-**Real advantage** on exploratory/read-heavy tasks. Neutral or slightly negative if Vibe
-fails and generates long error output that comes back into Claude's context.
+**Real advantage** on exploratory tasks. Neutral or slightly negative if Vibe fails and
+generates long error output that comes back into Claude's context.
+
+**Approximate pricing (Mistral Codestral):**
+- ~$1.5/M input tokens, ~$7.5/M output tokens
+- Claude Sonnet 4.6: ~$3/M input, ~$15/M output
+- Typical ratio: ~2x cheaper per token than Claude, plus 0 Claude tokens on orchestration overhead
+
+Real token counts and cost are printed after every run and appended to the run log.
+
+---
+
+## Run Log
+
+Every run appends one JSON entry to `~/.local/share/delegate-runs.jsonl`.
+
+**Fields logged:**
+
+| Field           | Type    | Description                                          |
+|-----------------|---------|------------------------------------------------------|
+| `ts`            | string  | ISO 8601 UTC timestamp                               |
+| `delegate`      | string  | `"vibe"`                                             |
+| `workdir`       | string  | Absolute project path                                |
+| `project`       | string  | `basename(workdir)`                                  |
+| `prompt_words`  | int     | Word count of the prompt (complexity proxy)          |
+| `agent`         | string  | Agent used (`"default"`, `"code-reviewer"`, etc.)   |
+| `max_turns`     | int     | Configured `--max-turns` value                       |
+| `timeout_secs`  | int     | Configured timeout in seconds                        |
+| `exit_code`     | int     | 0=success · 124=timeout · other=error                |
+| `timed_out`     | bool    | `true` if `exit_code == 124`                         |
+| `tool_calls`    | int     | Total tool invocations made by Vibe                  |
+| `files_changed` | int     | Files modified (git diff count)                      |
+| `syntax_errors` | int     | Python/JS syntax errors detected post-run            |
+| `duration_secs` | float   | Total wall-clock duration                            |
+| `tokens_in`     | int     | Prompt tokens (from Mistral session log)             |
+| `tokens_out`    | int     | Completion tokens                                    |
+| `tokens_total`  | int     | Total tokens                                         |
+| `cost_usd`      | float   | Estimated cost in USD                                |
+| `model`         | string  | `"mistral"`                                          |
+
+**Useful queries:**
+```bash
+# All recent runs
+cat ~/.local/share/delegate-runs.jsonl | python3 -m json.tool | less
+
+# Success rate
+jq -r '[.exit_code] | @tsv' ~/.local/share/delegate-runs.jsonl | sort | uniq -c
+
+# Timed-out runs
+jq 'select(.timed_out == true)' ~/.local/share/delegate-runs.jsonl
+
+# Total cost
+jq -r '.cost_usd' ~/.local/share/delegate-runs.jsonl \
+  | awk '{sum+=$1} END {printf "Total: $%.4f\n", sum}'
+```
+
+---
+
+## See Also
+
+A sister delegate using Gemini CLI exists: [gemini-skill](https://github.com/pcx-wave/gemini-skill).
+Both write to the same `delegate-runs.jsonl` log, making runs comparable across delegates.

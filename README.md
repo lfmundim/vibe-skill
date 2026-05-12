@@ -16,6 +16,7 @@ When you type `/vibe <instruction>` in Claude Code, this skill:
 4. Streams structured output: `[read]`, `[write]`, `[WARN]`, `[SYNTAX ERROR]`
 5. Runs post-run syntax checks on modified `.py` and `.js` files automatically
 6. Reports the git diff and any issues to you
+7. Appends a structured JSON entry to `~/.local/share/delegate-runs.jsonl` (tokens, cost, duration, exit code)
 
 ---
 
@@ -98,8 +99,10 @@ Claude Code
                  │         └─ allocates pseudo-TTY (required — vibe hangs without one)
                  ├─ pipes JSON streaming output through Python parser
                  │         └─ prints [read] / [write] / [WARN] / [vibe] lines
+                 ├─ reads real token counts from Mistral session log
                  ├─ runs syntax checks on modified .py and .js files
-                 └─ prints git diff --stat
+                 ├─ prints git diff --stat
+                 └─ appends JSON entry to ~/.local/share/delegate-runs.jsonl
 ```
 
 ### Why the pseudo-TTY?
@@ -161,6 +164,14 @@ See `examples/anti-patterns.md` for full examples with root causes.
 
 See `/tmp/retour_claude_vibe.txt` in this repo for the original feedback from Claude
 that led to the improvements in `vibe-delegate`.
+
+---
+
+## Sister project
+
+A parallel delegate using **Gemini CLI** instead of Vibe is available at
+[pcx-wave/gemini-skill](https://github.com/pcx-wave/gemini-skill).
+Same orchestration pattern, same run log format — different model and trade-offs.
 
 ---
 

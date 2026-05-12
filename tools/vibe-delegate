@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# vibe-delegate — Runs Vibe programmatically and captures structured output
+# vibe-delegate — Lance Vibe en mode programmatique et capture le résultat
 # Usage: vibe-delegate <workdir> <prompt> [max-turns] [agent] [timeout-secs]
 #
-# ROOT CAUSE FIX: vibe checks for a TTY on startup. Without one (e.g. when
-# piped directly), it hangs indefinitely — 0 tool calls, silent timeout.
-# Fix: wrap vibe in `script -q -c "..." /dev/null` to allocate a pseudo-TTY.
+# ROOT CAUSE FIX (2026-05-10):
+#   vibe checks for a TTY on startup. Without one (e.g. when piped directly),
+#   it hangs indefinitely waiting for terminal initialisation → 0 tool calls,
+#   silent timeout. Fix: wrap vibe in `script -q -c "..." /dev/null` to allocate
+#   a pseudo-TTY. The JSON streaming output is then piped cleanly to the parser.
 #
-# PROMPT SAFETY: prompts with Python code, dicts, colons, emojis, or accented
-# chars are passed via a temp file (printf %q) — avoids shell injection/truncation.
+# PROMPT SAFETY (2026-05-12):
+#   Long prompts with Python code, dicts, colons, emojis, or accented chars are
+#   passed via a temp file (read by vibe via --prompt-file if supported, else via
+#   a wrapper that cats the file). This avoids shell injection / truncation bugs.
 #
-# POST-RUN: automatically syntax-checks modified .py and .js files.
-
-set -euo pipefail
+# RUN LOG (2026-05-12):
+#   Appends one JSONL entry to ~/.local/share/delegate-runs.jsonl after each run.
+#   Fields: ts, delegate, project, prompt_words, agent, max_turns, timeout_secs,
+#           exit_code, timed_out, tool_calls, files_changed, syntax_errors,
+#           duration_secs, tokens_in, tokens_out, tokens_total, cost_usd, model.
 
 WORKDIR="${1:?Usage: vibe-delegate <workdir> <prompt> [max-turns] [agent] [timeout-secs]}"
 PROMPT="${2:?Prompt required}"
@@ -25,7 +31,11 @@ if [ ! -d "$WORKDIR" ]; then
 fi
 
 cd "$WORKDIR"
+START_NS=$(date +%s%N)
+PROMPT_WORDS=$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')
 GIT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+
+# Track modified files for post-run syntax checks
 FILES_BEFORE=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 
 echo "=== VIBE START ==="
@@ -42,8 +52,15 @@ PROMPT_FILE=$(mktemp /tmp/vibe-prompt-XXXXXX.txt)
 printf '%s' "$PROMPT" > "$PROMPT_FILE"
 
 # Write the vibe command to a temp script.
+# Reads the prompt from the file to stay safe from shell expansion.
 VIBE_SCRIPT=$(mktemp /tmp/vibe-cmd-XXXXXX.sh)
-trap 'rm -f "$VIBE_SCRIPT" "$PROMPT_FILE" /tmp/vibe-syntax-err.txt 2>/dev/null' EXIT
+
+# Stats handoff file: Python parser writes JSON here; bash reads it for the log.
+DELEGATE_STATS_FILE=$(mktemp /tmp/delegate-stats-XXXXXX.json)
+printf '{}' > "$DELEGATE_STATS_FILE"
+export DELEGATE_STATS_FILE
+
+trap 'rm -f "$VIBE_SCRIPT" "$PROMPT_FILE" "$DELEGATE_STATS_FILE"' EXIT
 
 {
   echo '#!/usr/bin/env bash'
@@ -58,13 +75,13 @@ trap 'rm -f "$VIBE_SCRIPT" "$PROMPT_FILE" /tmp/vibe-syntax-err.txt 2>/dev/null' 
 } > "$VIBE_SCRIPT"
 chmod +x "$VIBE_SCRIPT"
 
-# Run vibe inside `script` to give it a pseudo-TTY (required).
-set +e
+# Run vibe inside `script` to give it a pseudo-TTY (required — vibe hangs without one).
 timeout "$TIMEOUT_SECS" script -q -c "$VIBE_SCRIPT" /dev/null | python3 -c "
-import sys, json, re
+import sys, json, re, os
 
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mABCDEFGHJKSTfhilmnprsu]|\x1b\([AB]|\x0f|\x0e')
 tools_called = 0
+writes = []
 def clean(line):
     line = line.replace('\r', '')
     return ANSI_RE.sub('', line).strip()
@@ -95,8 +112,11 @@ for raw in sys.stdin:
         first_line = content.split('\n')[0] if content else ''
         tool_name  = msg.get('tool', '') or msg.get('name', '')
 
+        # Detect writes to track files for syntax check
         if 'write' in tool_name.lower() or 'edit' in tool_name.lower():
             filepath = msg.get('path') or msg.get('file_path') or ''
+            if filepath:
+                writes.append(filepath)
             print(f'  [tool]  file: {filepath or first_line[:80]}', flush=True)
         elif first_line.startswith('path:'):
             print(f'  [read]  {first_line[5:].strip()}', flush=True)
@@ -110,19 +130,28 @@ for raw in sys.stdin:
         elif 'command' in tool_name.lower():
             print(f'  [tool]  command: {first_line[:100]}', flush=True)
         else:
-            print(f'  [tool]  {(first_line or content)[:100]}', flush=True)
+            snippet = (first_line or content)[:100]
+            print(f'  [tool]  {snippet}', flush=True)
 
 print(f'Tool calls: {tools_called}')
+
+# Write partial stats (tool_calls) so the token block can merge into it.
+_sf = os.environ.get('DELEGATE_STATS_FILE', '')
+if _sf:
+    try:
+        with open(_sf, 'w') as _f:
+            json.dump({'tool_calls': tools_called}, _f)
+    except Exception:
+        pass
 "
 VIBE_EXIT=$?
-set -e
 
 # ── Real Mistral token counts from session log ─────────────────────────────────
 VIBE_HOME="${VIBE_HOME:-$HOME/.vibe}"
 SESSION_LOG=$(ls -t "$VIBE_HOME/logs/session"/*/meta.json 2>/dev/null | head -1)
 if [ -n "$SESSION_LOG" ]; then
   python3 -c "
-import json, sys
+import json, sys, os
 try:
     with open('$SESSION_LOG') as f:
         data = json.load(f)
@@ -137,6 +166,22 @@ try:
     print(f'Mistral tokens (real): {total:,}  ({prompt:,} prompt + {completion:,} completion)  |  cost ~\${cost_turn:.4f}')
     print(f'Claude Sonnet 4.6 eq: same tokens would cost ~\${claude_cost:.4f}  (ratio x{claude_cost/cost_turn:.1f})' if cost_turn > 0 else f'Claude Sonnet 4.6 eq: ~\${claude_cost:.4f}')
     print(f'Session total so far : {session_total:,} tokens  |  session cost ~\${cost:.4f}')
+    # Merge token stats into the delegate stats file.
+    sf = os.environ.get('DELEGATE_STATS_FILE', '')
+    if sf:
+        try:
+            existing = json.load(open(sf))
+        except Exception:
+            existing = {}
+        existing.update({
+            'tokens_in':    prompt,
+            'tokens_out':   completion,
+            'tokens_total': total,
+            'cost_usd':     round(cost_turn, 6),
+            'model':        'mistral',
+        })
+        with open(sf, 'w') as wf:
+            json.dump(existing, wf)
 except Exception as e:
     print(f'(token read failed: {e})')
 " 2>/dev/null
@@ -150,10 +195,13 @@ else
 fi
 
 # ── Post-run syntax checks ─────────────────────────────────────────────────────
+# Check any modified Python or JS files automatically — saves a manual step.
 FILES_AFTER=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-CHANGED=$(comm -13 <(echo "$FILES_BEFORE" | sort) <(echo "$FILES_AFTER" | sort) 2>/dev/null || true)
+CHANGED=$(comm -13 <(echo "$FILES_BEFORE" | sort) <(echo "$FILES_AFTER" | sort) 2>/dev/null)
 
-PY_ERRORS=0; JS_ERRORS=0; CHECKED=0
+PY_ERRORS=0
+JS_ERRORS=0
+CHECKED=0
 
 while IFS= read -r f; do
   [ -z "$f" ] && continue
@@ -173,11 +221,11 @@ while IFS= read -r f; do
 done <<< "$CHANGED"
 
 if [ "$CHECKED" -gt 0 ]; then
-  TOTAL=$((PY_ERRORS+JS_ERRORS))
-  if [ "$TOTAL" -eq 0 ]; then
+  TOTAL_ERRORS=$((PY_ERRORS+JS_ERRORS))
+  if [ "$TOTAL_ERRORS" -eq 0 ]; then
     echo "=== SYNTAX OK ($CHECKED file(s) checked) ==="
   else
-    echo "=== SYNTAX ERRORS: $TOTAL in $CHECKED file(s) — fix before committing ==="
+    echo "=== SYNTAX ERRORS: $TOTAL_ERRORS in $CHECKED file(s) — fix before committing ==="
   fi
 fi
 
@@ -197,5 +245,68 @@ else
   git diff --stat 2>/dev/null || echo "(no git)"
   git status --short 2>/dev/null
 fi
+
+rm -f /tmp/vibe-syntax-err.txt
+
+# ── Run log ────────────────────────────────────────────────────────────────────
+END_NS=$(date +%s%N)
+FILES_CHANGED_COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+TOTAL_ERRORS=$((PY_ERRORS + JS_ERRORS))
+
+export DELEGATE_NAME="vibe"
+export DELEGATE_WORKDIR="$WORKDIR"
+export DELEGATE_EXIT="$VIBE_EXIT"
+export DELEGATE_TIMEOUT="$TIMEOUT_SECS"
+export DELEGATE_PROMPT_WORDS="$PROMPT_WORDS"
+export DELEGATE_AGENT="${AGENT:-default}"
+export DELEGATE_MAX_TURNS="$MAX_TURNS"
+export DELEGATE_FILES_CHANGED="$FILES_CHANGED_COUNT"
+export DELEGATE_SYNTAX_ERRORS="$TOTAL_ERRORS"
+export DELEGATE_START_NS="$START_NS"
+export DELEGATE_END_NS="$END_NS"
+
+python3 << 'PYLOG'
+import json, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+LOG = Path.home() / '.local' / 'share' / 'delegate-runs.jsonl'
+LOG.parent.mkdir(parents=True, exist_ok=True)
+
+sf = os.environ.get('DELEGATE_STATS_FILE', '')
+stats = {}
+if sf:
+    try:
+        stats = json.loads(Path(sf).read_text())
+    except Exception:
+        pass
+
+start_ns = int(os.environ.get('DELEGATE_START_NS', 0) or 0)
+end_ns   = int(os.environ.get('DELEGATE_END_NS',   0) or 0)
+duration = round((end_ns - start_ns) / 1e9, 1) if start_ns and end_ns else 0
+
+entry = {
+    'ts':            datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'delegate':      os.environ.get('DELEGATE_NAME', 'vibe'),
+    'workdir':       os.environ.get('DELEGATE_WORKDIR', ''),
+    'project':       os.path.basename(os.environ.get('DELEGATE_WORKDIR', '')),
+    'prompt_words':  int(os.environ.get('DELEGATE_PROMPT_WORDS', 0) or 0),
+    'agent':         os.environ.get('DELEGATE_AGENT', 'default'),
+    'max_turns':     int(os.environ.get('DELEGATE_MAX_TURNS', 0) or 0),
+    'timeout_secs':  int(os.environ.get('DELEGATE_TIMEOUT', 0) or 0),
+    'exit_code':     int(os.environ.get('DELEGATE_EXIT', 0) or 0),
+    'timed_out':     os.environ.get('DELEGATE_EXIT') == '124',
+    'files_changed': int(os.environ.get('DELEGATE_FILES_CHANGED', 0) or 0),
+    'syntax_errors': int(os.environ.get('DELEGATE_SYNTAX_ERRORS', 0) or 0),
+    'duration_secs': duration,
+}
+entry.update(stats)
+
+with open(LOG, 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+
+tok = entry.get('tokens_total', '?')
+print(f'[log] → {LOG}  ({tok} tokens, exit {entry["exit_code"]}, {duration}s)')
+PYLOG
 
 exit $VIBE_EXIT
